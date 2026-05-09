@@ -1,5 +1,7 @@
 #include "snes_runtime.h"
 #include "string.h"
+#include <immintrin.h>  // AVX2 intrinsics — no stdlib, just CPU headers
+
 
 typedef struct alloc_hdr {
     u32 size;
@@ -66,29 +68,143 @@ void *realloc(void *ptr, size_t size) {
     return new_ptr;
 }
 
+
 void *memcpy(void *dst, const void *src, size_t size) {
     u8 *d = (u8 *)dst;
     const u8 *s = (const u8 *)src;
-    for (size_t i = 0; i < size; i++) d[i] = s[i];
-    return dst;
-}
 
-void *memmove(void *dst, const void *src, size_t size) {
-    u8 *d = (u8 *)dst;
-    const u8 *s = (const u8 *)src;
-    if (d == s || size == 0) return dst;
-    if (d < s) {
-        for (size_t i = 0; i < size; i++) d[i] = s[i];
-    } else {
-        for (size_t i = size; i > 0; i--) d[i - 1] = s[i - 1];
+    // AVX2 — 32 bytes per iteration
+    // Process as many full 32-byte chunks as possible first
+    while (size >= 32) {
+        // loadu/storeu handle unaligned pointers safely on x86
+        _mm256_storeu_si256((__m256i *)d,
+                            _mm256_loadu_si256((const __m256i *)s));
+        d += 32; s += 32; size -= 32;
     }
+    // 16-byte SSE2 tail
+    if (size >= 16) {
+        _mm_storeu_si128((__m128i *)d,
+                         _mm_loadu_si128((const __m128i *)s));
+        d += 16; s += 16; size -= 16;
+    }
+    // 8-byte tail
+    if (size >= 8) {
+        *(u64 *)d = *(const u64 *)s;
+        d += 8; s += 8; size -= 8;
+    }
+    // 4-byte tail
+    if (size >= 4) {
+        *(u32 *)d = *(const u32 *)s;
+        d += 4; s += 4; size -= 4;
+    }
+    // byte tail (at most 3 bytes)
+    while (size--) *d++ = *s++;
     return dst;
 }
 
 void *memset(void *dst, int value, size_t size) {
     u8 *d = (u8 *)dst;
     u8 v = (u8)value;
-    for (size_t i = 0; i < size; i++) d[i] = v;
+
+    // Align to 32-byte boundary first using scalar stores
+    // so the AVX2 path always hits aligned addresses
+    while (size > 0 && ((u64)d & 31)) {
+        *d++ = v;
+        size--;
+    }
+
+    if (size >= 32) {
+        // Broadcast the byte into all 32 lanes of a YMM register
+        __m256i wide = _mm256_set1_epi8((char)v);
+
+        // Unrolled 4x = 128 bytes per iteration — reduces loop overhead
+        while (size >= 128) {
+            _mm256_store_si256((__m256i *)(d +  0), wide);
+            _mm256_store_si256((__m256i *)(d + 32), wide);
+            _mm256_store_si256((__m256i *)(d + 64), wide);
+            _mm256_store_si256((__m256i *)(d + 96), wide);
+            d += 128; size -= 128;
+        }
+        // remaining 32-byte chunks
+        while (size >= 32) {
+            _mm256_store_si256((__m256i *)d, wide);
+            d += 32; size -= 32;
+        }
+        // 16-byte tail
+        if (size >= 16) {
+            _mm_store_si128((__m128i *)d, _mm256_castsi256_si128(wide));
+            d += 16; size -= 16;
+        }
+    }
+
+    // byte tail
+    while (size--) *d++ = v;
+    return dst;
+}
+
+void *memmove(void *dst, const void *src, size_t size) {
+    u8 *d = (u8 *)dst;
+    const u8 *s = (const u8 *)src;
+
+    if (d == s || size == 0) return dst;
+
+    if (d < s || d >= s + size) {
+        // No overlap OR dst is fully after src — safe forward copy
+        // Identical to memcpy AVX2 path
+        while (size >= 32) {
+            _mm256_storeu_si256((__m256i *)d,
+                                _mm256_loadu_si256((const __m256i *)s));
+            d += 32; s += 32; size -= 32;
+        }
+        if (size >= 16) {
+            _mm_storeu_si128((__m128i *)d,
+                             _mm_loadu_si128((const __m128i *)s));
+            d += 16; s += 16; size -= 16;
+        }
+        if (size >= 8) {
+            *(u64 *)d = *(const u64 *)s; d += 8; s += 8; size -= 8;
+        }
+        if (size >= 4) {
+            *(u32 *)d = *(const u32 *)s; d += 4; s += 4; size -= 4;
+        }
+        while (size--) *d++ = *s++;
+
+    } else {
+        // Overlapping and dst > src — must copy backwards
+        // Advance to end of both buffers
+        d += size;
+        s += size;
+
+        // Byte-align the tail (from the end) before switching to AVX2
+        while (size > 0 && ((u64)d & 31)) {
+            *--d = *--s;
+            size--;
+        }
+
+        // AVX2 backward — 32 bytes per iteration
+        while (size >= 32) {
+            d -= 32; s -= 32;
+            _mm256_storeu_si256((__m256i *)d,
+                                _mm256_loadu_si256((const __m256i *)s));
+            size -= 32;
+        }
+        // 16-byte backward tail
+        if (size >= 16) {
+            d -= 16; s -= 16;
+            _mm_storeu_si128((__m128i *)d,
+                             _mm_loadu_si128((const __m128i *)s));
+            size -= 16;
+        }
+        // 8-byte backward tail
+        if (size >= 8) {
+            d -= 8; s -= 8;
+            *(u64 *)d = *(const u64 *)s;
+            size -= 8;
+        }
+        // byte tail
+        while (size--) *--d = *--s;
+    }
+
     return dst;
 }
 

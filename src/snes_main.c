@@ -2,6 +2,11 @@
 #include "ftp.h"
 #include "tables.h"
 #include "snes/snes.h"
+#include "snes_runtime.h"
+
+extern void *memset(void *dst, int value, size_t size);
+extern void *memcpy(void *dst, const void *src, size_t size);
+extern void *memmove(void *dst, const void *src, size_t size);
 
 #define MENU_W 384
 #define MENU_H 216
@@ -32,19 +37,19 @@
 #define SNES_SAVE_DIR_PRIMARY "/savedata0/brunoroque_snes"
 #define SNES_SAVE_DIR_FTP "/av_contents/content_tmp"
 
-#define UI_BG    0
-#define UI_BRAND 1
-#define UI_HEAD  2
-#define UI_LINE  3
-#define UI_SEL   4
-#define UI_TEXT  5
-#define UI_DIM   6
-#define UI_CUR   7
-#define UI_NUM   8
-#define UI_PANEL 9
-#define UI_PANEL2 10
-#define UI_ACCENT 11
-#define UI_BLACK 12
+#define UI_BG      0  // Deep Aubergine
+#define UI_HEAD    1  // Header White
+#define UI_TEXT    2  // Body Text (Warm White)
+#define UI_DIM     3  // Muted Silk (Gray)
+#define UI_BRAND   4  // Canonical Orange
+#define UI_SEL     5  // Selection (Lighter Purple)
+#define UI_PANEL   6  // Surface (Mid-Aubergine)
+#define UI_CUR     7  // Focus Cursor (Orange)
+#define UI_ACCENT  8  // Warm Blue
+#define UI_NUM     9  // Stats/Numbers
+#define UI_PANEL2  10 // Darker Panel
+#define UI_LINE    11 // Thin Separator
+#define UI_BLACK   12 // Shadow/Ultra Dark
 
 #define BTN_B      0x0001
 #define BTN_Y      0x0002
@@ -62,10 +67,30 @@
 #define BTN_L2     0x2000
 
 static const u32 ui_palette32[] = {
-    0xFF191621, 0xFFF05DA8, 0xFFF5F0FF, 0xFFA691C6, 0xFFFF8FCC,
-    0xFFF8F5FF, 0xFFC7B8DC, 0xFF73E1FF, 0xFFE2D7F2, 0xFF2A2433,
-    0xFF3C334A, 0xFF7B6AFF, 0xFF0A0810
+    0xFF0B0F14, // background
+    0xFF4DA3FF, // primary accent
+    0xFFF5F7FA, // main text
+    0xFF9AA4B2, // secondary text
+    0xFF7CC4FF, // highlight
+    0xFF151B23, // card background
+    0xFF232A34, // borders
+    0xFF00D4FF, // glow cyan
+    0xFF3B4452, // muted UI
+    0xFF10151C, // deep panel
+    0xFF1C2330, // hover
+    0xFF6E8BFF, // selected item
+    0xFF05070A  // ultra dark
 };
+
+static u32 mix(u32 c0, u32 c1, u32 c2, u32 c3, int tx, int ty) {
+    u32 r = ((((c0 >> 16) & 0xff) * (256 - tx) + ((c1 >> 16) & 0xff) * tx) * (256 - ty) +
+             (((c2 >> 16) & 0xff) * (256 - tx) + ((c3 >> 16) & 0xff) * tx) * ty) >> 16;
+    u32 g = ((((c0 >> 8) & 0xff) * (256 - tx) + ((c1 >> 8) & 0xff) * tx) * (256 - ty) +
+             (((c2 >> 8) & 0xff) * (256 - tx) + ((c3 >> 8) & 0xff) * tx) * ty) >> 16;
+    u32 b = ((((c0) & 0xff) * (256 - tx) + ((c1) & 0xff) * tx) * (256 - ty) +
+             (((c2) & 0xff) * (256 - tx) + ((c3) & 0xff) * tx) * ty) >> 16;
+    return 0xff000000 | (r << 16) | (g << 8) | b;
+}
 
 struct snes_audio {
     void *gadget;
@@ -288,7 +313,25 @@ static void diag_log(void *G, void *sendto_fn, s32 log_fd, u8 *log_sa,
 }
 
 static void clear_fb(u32 *fb) {
-    for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF000000;
+    // 1. Seed the first row using 64-bit writes (moving 2 pixels at a time)
+    u64 *row64 = (u64 *)fb;
+    u64 black64 = 0xFF000000FF000000ULL; // Two Opaque Black pixels
+    for (int i = 0; i < SCR_W / 2; i++) {
+        row64[i] = black64;
+    }
+    if (SCR_W % 2 != 0) {
+        fb[SCR_W - 1] = 0xFF000000;
+    }
+    int total_pixels = SCR_W * SCR_H;
+    int filled = SCR_W;
+    while (filled < total_pixels) {
+        int to_copy = filled;
+        if (filled + to_copy > total_pixels) {
+            to_copy = total_pixels - filled;
+        }
+        memcpy(fb + filled, fb, to_copy * sizeof(u32));
+        filled += to_copy;
+    }
 }
 
 static u32 align_up_u32(u32 value, u32 alignment) {
@@ -321,6 +364,8 @@ static void ui_draw_char(u8 *scr, int x, int y, char ch, u8 color) {
             if (!(bits & (0x80 >> c))) continue;
             int px = x + c;
             int py = y + r;
+            if (px + 1 >= 0 && px + 1 < MENU_W && py + 1 >= 0 && py + 1 < MENU_H)
+                scr[(py + 1) * MENU_W + (px + 1)] = 12;
             if (px >= 0 && px < MENU_W && py >= 0 && py < MENU_H)
                 scr[py * MENU_W + px] = color;
         }
@@ -512,15 +557,30 @@ static void ui_present_status(void *G, void *vid_flip, void *wait_eq, s32 video,
 
 static void scale_menu_to_framebuf(u32 *fb, const u8 *scr) {
     clear_fb(fb);
-    for (int y = 0; y < MENU_H; y++) {
-        int sy = MENU_OFF_Y + y * MENU_SCALE_Y;
-        for (int x = 0; x < MENU_W; x++) {
-            u32 color = ui_palette32[scr[y * MENU_W + x] % (sizeof(ui_palette32) / sizeof(ui_palette32[0]))];
-            int sx = MENU_OFF_X + x * MENU_SCALE_X;
-            for (int dy = 0; dy < MENU_SCALE_Y; dy++) {
-                u32 *row = &fb[(sy + dy) * SCR_W + sx];
-                for (int dx = 0; dx < MENU_SCALE_X; dx++) row[dx] = color;
-            }
+    for (int dy = 0; dy < MENU_H * MENU_SCALE_Y; dy++) {
+        int y0 = dy / MENU_SCALE_Y;
+        int y1 = (y0 + 1 < MENU_H) ? y0 + 1 : y0;
+        int ty = ((dy % MENU_SCALE_Y) * 256) / MENU_SCALE_Y;
+
+        // Vertical duplicate optimization (same trick as snes blit)
+        u32 *dst_row = fb + (MENU_OFF_Y + dy) * SCR_W + MENU_OFF_X;
+        if (ty == 0 && dy > 0) {
+            memcpy(dst_row, fb + (MENU_OFF_Y + dy - 1) * SCR_W + MENU_OFF_X,
+                   MENU_W * MENU_SCALE_X * sizeof(u32));
+            continue;
+        }
+
+        for (int dx = 0; dx < MENU_W * MENU_SCALE_X; dx++) {
+            int x0 = dx / MENU_SCALE_X;
+            int x1 = (x0 + 1 < MENU_W) ? x0 + 1 : x0;
+            int tx = ((dx % MENU_SCALE_X) * 256) / MENU_SCALE_X;
+
+            u32 c0 = ui_palette32[scr[y0 * MENU_W + x0] % 13];
+            u32 c1 = ui_palette32[scr[y0 * MENU_W + x1] % 13];
+            u32 c2 = ui_palette32[scr[y1 * MENU_W + x0] % 13];
+            u32 c3 = ui_palette32[scr[y1 * MENU_W + x1] % 13];
+
+            dst_row[dx] = mix(c0, c1, c2, c3, tx, ty);
         }
     }
 }
@@ -536,38 +596,51 @@ static void scale_snes_to_framebuf(u32 *fb, const u8 *pixels, int widescreen) {
         wide_map_ready = 1;
     }
 
-    for (int y = 0; y < SNES_FB_H; y++) {
-        int sy = SNES_OFF_Y + y * SNES_SCALE;
-        const u8 *src_row = pixels + (y & ~1) * SNES_FB_W * 4;
-        u32 *dst_row0 = fb + sy * SCR_W + dest_x;
-        u32 *dst_row1 = dst_row0 + SCR_W;
+    for (int dy = 0; dy < SNES_FB_H * SNES_SCALE; dy++) {
+        u32 *dst_row = fb + (SNES_OFF_Y + dy) * SCR_W + dest_x;
+        int ty = ((dy % SNES_SCALE) * 256) / SNES_SCALE;
+
+        if (ty == 0 && dy > 0) {
+            u32 *prev_row = fb + (SNES_OFF_Y + dy - 1) * SCR_W + dest_x;
+            memcpy(dst_row, prev_row, dest_w * sizeof(u32));
+            continue;
+        }
+
+        int y0 = dy / SNES_SCALE;
+        int y1 = (y0 + 1 < SNES_FB_H) ? y0 + 1 : y0;
 
         for (int dx = 0; dx < dest_w; dx++) {
-            int src_x = widescreen ? wide_map[dx] : (dx >> 1);
-            const u8 *px = src_row + src_x * 4;
-            u32 color = 0xFF000000 | ((u32)px[2] << 16) | ((u32)px[1] << 8) | (u32)px[0];
-            dst_row0[dx] = color;
-            dst_row1[dx] = color;
+            int x0 = widescreen ? wide_map[dx] : (dx / SNES_SCALE);
+            int x1 = (x0 + 1 < SNES_FB_W) ? x0 + 1 : x0;
+            int tx = widescreen ? 0 : ((dx % SNES_SCALE) * 256) / SNES_SCALE;
+
+            const u8 *p0 = pixels + (y0 * SNES_FB_W + x0) * 4;
+            const u8 *p1 = pixels + (y0 * SNES_FB_W + x1) * 4;
+            const u8 *p2 = pixels + (y1 * SNES_FB_W + x0) * 4;
+            const u8 *p3 = pixels + (y1 * SNES_FB_W + x1) * 4;
+
+            u32 c0 = 0xff000000 | (p0[2] << 16) | (p0[1] << 8) | p0[0];
+            u32 c1 = 0xff000000 | (p1[2] << 16) | (p1[1] << 8) | p1[0];
+            u32 c2 = 0xff000000 | (p2[2] << 16) | (p2[1] << 8) | p2[0];
+            u32 c3 = 0xff000000 | (p3[2] << 16) | (p3[1] << 8) | p3[0];
+
+            dst_row[dx] = mix(c0, c1, c2, c3, tx, ty);
         }
     }
 }
-
 static void audio_reset(struct snes_audio *audio, void *G, void *audio_fn, s32 handle) {
     audio->gadget = G;
     audio->audio_out_fn = audio_fn;
     audio->audio_handle = handle;
-    audio->pos = 0;
-    for (int i = 0; i < SNES_AUDIO_BUF_SAMPLES * 2; i++) audio->buf[i] = 0;
+    audio->pos = 0;memset
+    (audio->buf, 0, sizeof(audio->buf));
 }
 
 static void audio_push(struct snes_audio *audio, const s16 *samples, int frames) {
-    while (frames > 0 && audio->pos < SNES_AUDIO_BUF_SAMPLES) {
-        audio->buf[audio->pos * 2] = samples[0];
-        audio->buf[audio->pos * 2 + 1] = samples[1];
-        audio->pos++;
-        samples += 2;
-        frames--;
-    }
+    int can_copy = SNES_AUDIO_BUF_SAMPLES - audio->pos;
+    if (frames < can_copy) can_copy = frames;
+    memcpy(audio->buf + audio->pos * 2, samples, can_copy * 2 * sizeof(s16));
+    audio->pos += can_copy;
 }
 
 static void audio_flush(struct snes_audio *audio) {
@@ -575,14 +648,13 @@ static void audio_flush(struct snes_audio *audio) {
     while (audio->pos >= SAMPLES_PER_BUF) {
         NC(audio->gadget, audio->audio_out_fn, (u64)audio->audio_handle, (u64)audio->buf, 0, 0, 0, 0);
         int rem = audio->pos - SAMPLES_PER_BUF;
-        for (int i = 0; i < rem * 2; i++) audio->buf[i] = audio->buf[SAMPLES_PER_BUF * 2 + i];
+        memmove(audio->buf, audio->buf + SAMPLES_PER_BUF * 2, rem * 2 * sizeof(s16));
         audio->pos = rem;
     }
 }
 
 static Snes *snes_host_init(struct snes_host_bundle *host) {
-    u8 *raw = (u8 *)host;
-    for (u32 i = 0; i < (u32)sizeof(*host); i++) raw[i] = 0;
+    memset(host, 0, sizeof(*host));
 
     Snes *snes = &host->snes;
     snes->cpu = &host->cpu;

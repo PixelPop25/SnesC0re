@@ -75,6 +75,8 @@ function Compile-Target {
     $commonArgs = @(
         "-target", "x86_64-freestanding-none",
         "-Os",
+        "-march=znver2",          # <-- ADD: Zen 2 (PS5 CPU), enables AVX2/BMI2/etc
+        "-funroll-loops", 
         "-ffreestanding",
         "-fno-stack-protector",
         "-fno-builtin",

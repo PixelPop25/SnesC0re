@@ -21,6 +21,8 @@ typedef signed char    s8;
 #define FB_ALIGNED  ((FB_SIZE + 0x1FFFFF) & ~0x1FFFFF)
 #define FB_TOTAL    (FB_ALIGNED * 2)
 
+
+
 #define NES_W  256
 #define NES_H  240
 #define SCALE  4
