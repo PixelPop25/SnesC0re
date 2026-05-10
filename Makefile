@@ -5,8 +5,7 @@ OBJ_DIR      := $(BUILD_DIR)/obj
 CC      ?= gcc
 OBJCOPY ?= objcopy
 
-CFLAGS  = -Os -march=znver2 -funroll-loops \
-          -ffreestanding -fno-stack-protector -fno-builtin \
+CFLAGS  = -O1 -ffast-math -march=znver2 -funroll-loops -ffreestanding -fno-stack-protector -fno-builtin \
           -fpie -mno-red-zone -mstackrealign -fomit-frame-pointer -fcf-protection=none \
           -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables \
           -Wall -Wno-unused-function -Isrc

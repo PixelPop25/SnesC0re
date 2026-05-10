@@ -1,7 +1,6 @@
 #include "snes_runtime.h"
 #include "string.h"
-#include <immintrin.h>  // AVX2 intrinsics — no stdlib, just CPU headers
-
+#include <immintrin.h>  
 
 typedef struct alloc_hdr {
     u32 size;
@@ -67,7 +66,6 @@ void *realloc(void *ptr, size_t size) {
     memcpy(new_ptr, ptr, (size_t)min_int((int)hdr->size, (int)size));
     return new_ptr;
 }
-
 
 void *memcpy(void *dst, const void *src, size_t size) {
     u8 *d = (u8 *)dst;
