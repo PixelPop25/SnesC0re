@@ -5,10 +5,10 @@ OBJ_DIR      := $(BUILD_DIR)/obj
 CC      ?= gcc
 OBJCOPY ?= objcopy
 
-CFLAGS  = -O1 -ffast-math -march=znver2 -funroll-loops -ffreestanding -fno-stack-protector -fno-builtin \
+CFLAGS  = -Os -ffreestanding -fno-stack-protector -fno-builtin \
           -fpie -mno-red-zone -mstackrealign -fomit-frame-pointer -fcf-protection=none \
           -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables \
-          -Wall -Wno-unused-function -Isrc
+          -Wall -Wno-unused-function -Isrc -march=znver2 -mavx2 -mfma -O3 -ffast-math -funroll-loops
 
 LDFLAGS = -T linker.ld -nostdlib -nostartfiles -static \
           -Wl,--build-id=none -Wl,--no-dynamic-linker -Wl,-z,norelro -no-pie

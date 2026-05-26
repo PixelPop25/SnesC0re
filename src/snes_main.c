@@ -2,10 +2,7 @@
 #include "ftp.h"
 #include "tables.h"
 #include "snes/snes.h"
-
-extern void *memcpy(void *dst, const void *src, __SIZE_TYPE__ size);
-extern void *memset(void *dst, int value, __SIZE_TYPE__ size);
-extern void *memmove(void *dst, const void *src, __SIZE_TYPE__ size);
+#include <immintrin.h>
 
 #define MENU_W 384
 #define MENU_H 216
@@ -71,16 +68,9 @@ static const u32 ui_palette32[] = {
     0xFF3C334A, 0xFF7B6AFF, 0xFF0A0810
 };
 
-
-static u32 mix(u32 c0, u32 c1, u32 c2, u32 c3, int tx, int ty) {
-    u32 r = ((((c0 >> 16) & 0xff) * (256 - tx) + ((c1 >> 16) & 0xff) * tx) * (256 - ty) +
-             (((c2 >> 16) & 0xff) * (256 - tx) + ((c3 >> 16) & 0xff) * tx) * ty) >> 16;
-    u32 g = ((((c0 >> 8) & 0xff) * (256 - tx) + ((c1 >> 8) & 0xff) * tx) * (256 - ty) +
-             (((c2 >> 8) & 0xff) * (256 - tx) + ((c3 >> 8) & 0xff) * tx) * ty) >> 16;
-    u32 b = ((((c0) & 0xff) * (256 - tx) + ((c1) & 0xff) * tx) * (256 - ty) +
-             (((c2) & 0xff) * (256 - tx) + ((c3) & 0xff) * tx) * ty) >> 16;
-    return 0xff000000 | (r << 16) | (g << 8) | b;
-}
+extern void *memcpy (void *d, const void *s, __SIZE_TYPE__ n);
+extern void *memset (void *d, int v,         __SIZE_TYPE__ n);
+extern void *memmove(void *d, const void *s, __SIZE_TYPE__ n);
 
 struct snes_audio {
     void *gadget;
@@ -102,6 +92,33 @@ struct snes_host_bundle {
     Input input1;
     Input input2;
 };
+
+// Read directly from raw XBGR pixel buffer — no intermediate array
+static inline u32 src_px(const u8 *px, int x, int y, int w, int h) {
+    if (x < 0) x = 0; else if (x >= w) x = w-1;
+    if (y < 0) y = 0; else if (y >= h) y = h-1;
+    const u8 *p = px + (y*w + x)*4;
+    return 0xFF000000u | ((u32)p[2]<<16) | ((u32)p[1]<<8) | p[0];
+}
+
+static inline u32 sc_blend(u32 a, u32 b) {
+    return 0xFF000000u
+        | ((((a>>16)&0xFF)+((b>>16)&0xFF))>>1)<<16
+        | ((((a>> 8)&0xFF)+((b>> 8)&0xFF))>>1)<< 8
+        | ((( a     &0xFF)+( b     &0xFF))>>1);
+}
+static inline u32 sc_b3(u32 a, u32 b) {
+    return 0xFF000000u
+        | ((3*((a>>16)&0xFF)+((b>>16)&0xFF))>>2)<<16
+        | ((3*((a>> 8)&0xFF)+((b>> 8)&0xFF))>>2)<< 8
+        | ((3*( a     &0xFF)+( b     &0xFF))>>2);
+}
+static inline int sc_eq(const u8*px,int ax,int ay,int bx,int by,int w,int h){
+    if(ax<0)ax=0;if(ax>=w)ax=w-1;if(ay<0)ay=0;if(ay>=h)ay=h-1;
+    if(bx<0)bx=0;if(bx>=w)bx=w-1;if(by<0)by=0;if(by>=h)by=h-1;
+    const u8*a=px+(ay*w+ax)*4, *b=px+(by*w+bx)*4;
+    return a[0]==b[0] && a[1]==b[1] && a[2]==b[2];
+}
 
 static void udp_log(void *G, void *sendto_fn, s32 fd, u8 *sa, const char *msg);
 static void diag_log(void *G, void *sendto_fn, s32 log_fd, u8 *log_sa,
@@ -286,6 +303,8 @@ static int scan_rom_dir(void *G, void *mmap, void *munmap, void *kopen, void *kc
     return rom_count;
 }
 
+
+
 static void udp_log(void *G, void *sendto_fn, s32 fd, u8 *sa, const char *msg) {
     if (fd < 0 || !sendto_fn) return;
     NC(G, sendto_fn, (u64)fd, (u64)msg, (u64)str_len(msg), 0, (u64)sa, 16);
@@ -302,8 +321,26 @@ static void diag_log(void *G, void *sendto_fn, s32 log_fd, u8 *log_sa,
     }
 }
 
+
 static void clear_fb(u32 *fb) {
-    for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF000000;
+    if (!fb) return;
+
+    const __m256i black = _mm256_set1_epi32(0xFF000000);
+    const int total_pixels = SCR_W * SCR_H;
+    int i = 0;
+
+    // AVX2 fast path (32 pixels per iteration)
+    for (; i + 32 <= total_pixels; i += 32) {
+        _mm256_storeu_si256((__m256i*)(fb + i), black);
+        _mm256_storeu_si256((__m256i*)(fb + i + 8), black);
+        _mm256_storeu_si256((__m256i*)(fb + i + 16), black);
+        _mm256_storeu_si256((__m256i*)(fb + i + 24), black);
+    }
+
+    // Cleanup remaining pixels
+    for (; i < total_pixels; i++) {
+        fb[i] = 0xFF000000;
+    }
 }
 
 static u32 align_up_u32(u32 value, u32 alignment) {
@@ -541,73 +578,92 @@ static void scale_menu_to_framebuf(u32 *fb, const u8 *scr) {
 }
 
 static void scale_snes_to_framebuf(u32 *fb, const u8 *pixels, int widescreen) {
-    static u16 wide_map[SNES_WIDE_W];
-    static int wide_map_ready = 0;
-    int dest_w = widescreen ? SNES_WIDE_W : SNES_NATIVE_W;
-    int dest_x = widescreen ? (SCR_W - SNES_WIDE_W) / 2 : SNES_OFF_X;
+    int sw = SNES_FB_W, sh = SNES_FB_H;
 
-    if (widescreen && !wide_map_ready) {
-        build_smart_wide_map(wide_map, SNES_WIDE_W, SNES_FB_W);
-        wide_map_ready = 1;
+    if (!widescreen) {
+        u32 *dst = fb + SNES_OFF_Y * SCR_W + SNES_OFF_X;
+        for (int sy = 0; sy < sh; sy++) {
+            for (int sx = 0; sx < sw; sx++) {
+                // Load 3x3 neighbourhood directly from source bytes
+                #define G(x,y) src_px(pixels,sx+(x),sy+(y),sw,sh)
+                u32 A=G(-1,-1),B=G(0,-1),C=G(1,-1);
+                u32 D=G(-1, 0),E=G(0, 0),F=G(1, 0);
+                u32 G2=G(-1,1),H=G(0, 1),I=G(1, 1);
+                #undef G
+                #define EQ(ax,ay,bx,by) sc_eq(pixels,sx+(ax),sy+(ay),sx+(bx),sy+(by),sw,sh)
+
+                u32 E0=E,E1=E,E2=E,E3=E;
+
+                if(EQ(-1,0,0,-1)&&!EQ(-1,0,0,1)&&!EQ(0,-1,1,0)&&E!=D&&E!=B)
+                    E0=(EQ(-1,0,-1,-1)&&EQ(0,-1,-1,-1))?sc_blend(E,D):sc_b3(E,D);
+                if(EQ(0,-1,1,0)&&!EQ(0,-1,-1,0)&&!EQ(1,0,0,1)&&E!=B&&E!=F)
+                    E1=(EQ(0,-1,1,-1)&&EQ(1,0,1,-1))?sc_blend(E,F):sc_b3(E,F);
+                if(EQ(-1,0,0,1)&&!EQ(-1,0,0,-1)&&!EQ(0,1,1,0)&&E!=D&&E!=H)
+                    E2=(EQ(-1,0,-1,1)&&EQ(0,1,-1,1))?sc_blend(E,D):sc_b3(E,D);
+                if(EQ(0,1,1,0)&&!EQ(0,1,-1,0)&&!EQ(1,0,0,-1)&&E!=H&&E!=F)
+                    E3=(EQ(0,1,1,1)&&EQ(1,0,1,1))?sc_blend(E,F):sc_b3(E,F);
+                #undef EQ
+
+                int ox=sx*2, oy=sy*2;
+                dst[ oy   *SCR_W+ox  ]=E0; dst[ oy   *SCR_W+ox+1]=E1;
+                dst[(oy+1)*SCR_W+ox  ]=E2; dst[(oy+1)*SCR_W+ox+1]=E3;
+            }
+        }
+        return;
     }
 
-    for (int dy = 0; dy < SNES_FB_H * SNES_SCALE; dy++) {
-        u32 *dst_row = fb + (SNES_OFF_Y + dy) * SCR_W + dest_x;
-        int ty = ((dy % SNES_SCALE) * 256) / SNES_SCALE;
-
-        if (ty == 0 && dy > 0) {
-            u32 *prev_row = fb + (SNES_OFF_Y + dy - 1) * SCR_W + dest_x;
-            memcpy(dst_row, prev_row, dest_w * sizeof(u32));
-            continue;
-        }
-
-        int y0 = dy / SNES_SCALE;
-        int y1 = (y0 + 1 < SNES_FB_H) ? y0 + 1 : y0;
-
-        for (int dx = 0; dx < dest_w; dx++) {
-            int x0 = widescreen ? wide_map[dx] : (dx / SNES_SCALE);
-            int x1 = (x0 + 1 < SNES_FB_W) ? x0 + 1 : x0;
-            int tx = widescreen ? 0 : ((dx % SNES_SCALE) * 256) / SNES_SCALE;
-
-            const u8 *p0 = pixels + (y0 * SNES_FB_W + x0) * 4;
-            const u8 *p1 = pixels + (y0 * SNES_FB_W + x1) * 4;
-            const u8 *p2 = pixels + (y1 * SNES_FB_W + x0) * 4;
-            const u8 *p3 = pixels + (y1 * SNES_FB_W + x1) * 4;
-
-            u32 c0 = 0xff000000 | (p0[2] << 16) | (p0[1] << 8) | p0[0];
-            u32 c1 = 0xff000000 | (p1[2] << 16) | (p1[1] << 8) | p1[0];
-            u32 c2 = 0xff000000 | (p2[2] << 16) | (p2[1] << 8) | p2[0];
-            u32 c3 = 0xff000000 | (p3[2] << 16) | (p3[1] << 8) | p3[0];
-
-            dst_row[dx] = mix(c0, c1, c2, c3, tx, ty);
+    // Widescreen — bilinear, no extra storage
+    static u16 wide_map[SNES_WIDE_W]; // 1706*2 = 3KB, negligible
+    static int wide_map_ready = 0;
+    if (!wide_map_ready) {
+        build_smart_wide_map(wide_map, SNES_WIDE_W, sw);
+        wide_map_ready = 1;
+    }
+    int dw = SNES_WIDE_W < SCR_W ? SNES_WIDE_W : SCR_W;
+    int dx = (SCR_W - dw) / 2;
+    for (int sy = 0; sy < sh; sy++) {
+        int oy0 = SNES_OFF_Y + sy*2;
+        if (oy0+1 >= SCR_H) break;
+        u32 *row0 = fb + oy0*SCR_W + dx;
+        u32 *row1 = row0 + SCR_W;
+        int sy1 = sy+1 < sh ? sy+1 : sy;
+        for (int x = 0; x < dw; x++) {
+            int x0=wide_map[x], x1=x0+1<sw?x0+1:x0;
+            u32 c00=src_px(pixels,x0,sy, sw,sh), c10=src_px(pixels,x1,sy, sw,sh);
+            u32 c01=src_px(pixels,x0,sy1,sw,sh), c11=src_px(pixels,x1,sy1,sw,sh);
+            row0[x] = sc_blend(c00,c10);
+            row1[x] = sc_blend(sc_blend(c00,c10),sc_blend(c01,c11));
         }
     }
 }
 
+
 static void audio_reset(struct snes_audio *audio, void *G, void *audio_fn, s32 handle) {
-    audio->gadget = G;
+    audio->gadget       = G;
     audio->audio_out_fn = audio_fn;
     audio->audio_handle = handle;
-    audio->pos = 0;
-    for (int i = 0; i < SNES_AUDIO_BUF_SAMPLES * 2; i++) audio->buf[i] = 0;
+    audio->pos          = 0;
+    memset(audio->buf, 0, sizeof(audio->buf));
 }
 
 static void audio_push(struct snes_audio *audio, const s16 *samples, int frames) {
-    while (frames > 0 && audio->pos < SNES_AUDIO_BUF_SAMPLES) {
-        audio->buf[audio->pos * 2] = samples[0];
-        audio->buf[audio->pos * 2 + 1] = samples[1];
-        audio->pos++;
-        samples += 2;
-        frames--;
-    }
+    int can = SNES_AUDIO_BUF_SAMPLES - audio->pos;
+    if (frames < can) can = frames;
+    if (can <= 0) return;
+    memcpy(audio->buf + audio->pos*2, samples, (__SIZE_TYPE__)can*2*sizeof(s16));
+    audio->pos += can;
 }
 
 static void audio_flush(struct snes_audio *audio) {
     if (audio->audio_handle < 0 || !audio->audio_out_fn) return;
     while (audio->pos >= SAMPLES_PER_BUF) {
-        NC(audio->gadget, audio->audio_out_fn, (u64)audio->audio_handle, (u64)audio->buf, 0, 0, 0, 0);
+        NC(audio->gadget, audio->audio_out_fn,
+           (u64)audio->audio_handle, (u64)audio->buf, 0, 0, 0, 0);
         int rem = audio->pos - SAMPLES_PER_BUF;
-        for (int i = 0; i < rem * 2; i++) audio->buf[i] = audio->buf[SAMPLES_PER_BUF * 2 + i];
+        if (rem > 0)
+            memmove(audio->buf,
+                    audio->buf + SAMPLES_PER_BUF*2,
+                    (__SIZE_TYPE__)rem*2*sizeof(s16));
         audio->pos = rem;
     }
 }

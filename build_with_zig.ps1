@@ -74,10 +74,12 @@ function Compile-Target {
 
     $commonArgs = @(
         "-target", "x86_64-freestanding-none",
-        "-O1",
-        "-march=znver2",
-        "-funroll-loops", 
+        "-Os",
         "-ffreestanding",
+        "-mavx2",
+        "-mfma",
+        "-mtune=znver2",
+        "-ffast-math",
         "-fno-stack-protector",
         "-fno-builtin",
         "-fpie",
